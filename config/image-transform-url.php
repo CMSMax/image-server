@@ -38,7 +38,7 @@ return [
     |
     */
 
-    'default_source_directory' => env('IMAGE_TRANSFORM_DEFAULT_SOURCE_DIRECTORY', 'images'),
+    'default_source_directory' => env('IMAGE_TRANSFORM_DEFAULT_SOURCE_DIRECTORY', 'production'),
 
     /*
     |--------------------------------------------------------------------------
@@ -49,7 +49,7 @@ return [
     |
     */
 
-    'route_prefix' => env('IMAGE_TRANSFORM_ROUTE_PREFIX', 'images'),
+    'route_prefix' => env('IMAGE_TRANSFORM_ROUTE_PREFIX', ''),
 
     /*
     |--------------------------------------------------------------------------
