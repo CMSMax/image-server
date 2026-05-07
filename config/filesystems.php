@@ -60,6 +60,19 @@ return [
             'report' => false,
         ],
 
+        's3-staging' => [
+            'driver' => 's3',
+            'key' => env('AWS_ACCESS_KEY_ID_STAGING'),
+            'secret' => env('AWS_SECRET_ACCESS_KEY_STAGING'),
+            'region' => env('AWS_DEFAULT_REGION_STAGING'),
+            'bucket' => env('AWS_BUCKET_STAGING'),
+            'url' => env('AWS_URL_STAGING'),
+            'endpoint' => env('AWS_ENDPOINT_STAGING'),
+            'use_path_style_endpoint' => env('AWS_USE_PATH_STYLE_ENDPOINT_STAGING', false),
+            'throw' => false,
+            'report' => false,
+        ],
+
     ],
 
     /*

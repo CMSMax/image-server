@@ -22,6 +22,9 @@ return [
         'images' => [
             'disk' => 's3', // Any valid Laravel Filesystem disk
         ],
+        'staging' => [
+            'disk' => 's3-staging',
+        ],
     ],
 
     /*
