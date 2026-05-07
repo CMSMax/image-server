@@ -19,7 +19,7 @@ return [
     */
 
     'source_directories' => [
-        'images' => [
+        'production' => [
             'disk' => 's3', // Any valid Laravel Filesystem disk
         ],
         'staging' => [
