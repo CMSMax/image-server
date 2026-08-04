@@ -36,16 +36,16 @@ it('serves an animated webp transform without a 500', function () {
     expect(substr_count($res->getContent(), 'ANMF'))->toBeGreaterThan(1);
 });
 
-it('falls back to original bytes when the input is undecodable', function () {
+it('redirects to the original when the input is undecodable', function () {
     // Valid WebP header so the mime gate passes, but a garbage payload that
-    // neither GD nor Imagick can decode -> the guaranteed serve-original path.
+    // neither GD nor Imagick can decode -> the guaranteed redirect-to-original path.
     $header = substr((string) file_get_contents(base_path('tests/fixtures/animated-tiny.webp')), 0, 16);
     Storage::disk('s3')->put('dir/broken.webp', $header.str_repeat("\x00", 256));
 
     $res = $this->get('/production/width=64,format=webp/dir/broken.webp');
 
-    $res->assertOk(); // safety net engaged, not a 500
-    expect($res->getContent())->not->toBeEmpty();
+    $res->assertRedirect(); // safety net engaged (302 to the original), not a 500
+    expect($res->headers->get('Location'))->toContain('broken.webp');
 });
 
 it('preserves a 404 for a missing file instead of falling back', function () {
@@ -67,9 +67,8 @@ it('still transforms static images via the default driver', function () {
     expect($res->headers->get('Content-Type'))->toBe('image/webp');
 });
 
-it('serves the original when the animated source exceeds the size guard', function () {
+it('redirects to the original when the source exceeds the size guard', function () {
     // Force the OOM size guard to trip on the tiny 3-frame fixture (1-byte cap).
-    config()->set('image-transform-url.cache.enabled', false);
     config()->set('image-transform-url.max_animated_bytes', 1);
 
     Storage::disk('s3')->putFileAs(
@@ -80,8 +79,7 @@ it('serves the original when the animated source exceeds the size guard', functi
 
     $res = $this->get('/production/width=64,format=webp/dir/big.webp');
 
-    $res->assertOk();
-    // Guard serves the untouched original -> mime is the source's image/webp,
-    // and the byte length matches the original fixture, not a re-encode.
-    expect($res->getContent())->toBe((string) file_get_contents(base_path('tests/fixtures/animated-tiny.webp')));
+    // Guard redirects to the untouched original instead of decoding it.
+    $res->assertRedirect();
+    expect($res->headers->get('Location'))->toContain('big.webp');
 });

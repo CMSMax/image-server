@@ -7,8 +7,8 @@ namespace App\Actions;
 use AceOfAces\LaravelImageTransformUrl\Actions\TransformImageAction as BaseTransformImageAction;
 use AceOfAces\LaravelImageTransformUrl\ValueObjects\ImageResult;
 use AceOfAces\LaravelImageTransformUrl\ValueObjects\ImageSource;
+use Illuminate\Http\Exceptions\HttpResponseException;
 use Illuminate\Support\Arr;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -28,7 +28,7 @@ use Throwable;
  * The default Intervention driver is GD, which cannot decode animated WebP and
  * throws an uncaught DecoderException -> HTTP 500. This subclass wraps handle()
  * with a two-stage safety net: (1) retry the transform with the Imagick driver
- * (animation-capable), (2) if that also fails, serve the original bytes as-is.
+ * (animation-capable), (2) if that also fails, redirect to the original image.
  * Bound over the vendor FQCN in AppServiceProvider so controllers resolve it.
  */
 class TransformImageAction extends BaseTransformImageAction
@@ -50,6 +50,8 @@ class TransformImageAction extends BaseTransformImageAction
                 if (extension_loaded('imagick')) {
                     return $this->transformWithImagick($pathPrefix, $path, $options);
                 }
+            } catch (HttpResponseException $redirect) {
+                throw $redirect; // size-guard redirect — propagate, don't treat as a failure
             } catch (Throwable $imagickError) {
                 report($imagickError);
             }
@@ -57,7 +59,7 @@ class TransformImageAction extends BaseTransformImageAction
             // Guaranteed safety net: never let a decode failure become a 500.
             report($gdError);
 
-            return $this->serveOriginal($pathPrefix, $path, $options);
+            $this->redirectToOriginal($pathPrefix, $path); // throws HttpResponseException
         }
     }
 
@@ -70,16 +72,16 @@ class TransformImageAction extends BaseTransformImageAction
     {
         $source = $this->handlePath($pathPrefix, $path); // re-resolves + re-validates (404 stays 404)
         $options = static::parseOptions($rawOptions);
-        $bytes = $this->readSourceBytes($source);
 
         // Pre-flight OOM guard: decoding a large animation in Imagick can exhaust
-        // memory_limit -> uncatchable PHP fatal, defeating the safety net. Cap on
-        // source size (cheap, already in memory) instead of risking the attempt.
-        if ($this->animatedSourceTooLarge($bytes)) {
-            return $this->serveOriginal($pathPrefix, $path, $rawOptions);
+        // memory_limit -> uncatchable PHP fatal, defeating the safety net. Check
+        // the source size via storage metadata (no download) and redirect the
+        // client straight to the original instead of risking the attempt.
+        if ($this->sourceTooLarge($source)) {
+            $this->redirectToOriginal($pathPrefix, $path); // throws HttpResponseException
         }
 
-        $image = ImageManager::imagick()->read($bytes);
+        $image = ImageManager::imagick()->read($this->readSourceBytes($source));
 
         if (Arr::hasAny($options, ['width', 'height'])) {
             $image->scale(
@@ -105,41 +107,20 @@ class TransformImageAction extends BaseTransformImageAction
     }
 
     /**
-     * Guaranteed safety net: stream the untouched original with its real mime
-     * type, cached under the transform key so repeat requests are cheap HITs.
+     * Guaranteed safety net: never let a decode failure become a 500. Instead of
+     * streaming the (potentially large) original through PHP, redirect the client
+     * to its storage URL so the CDN/origin serves it directly. Throws, so callers
+     * never fall through.
      */
-    protected function serveOriginal(?string $pathPrefix, ?string $path, string $rawOptions): ImageResult
+    protected function redirectToOriginal(?string $pathPrefix, ?string $path): never
     {
-        $source = $this->handlePath($pathPrefix, $path);
-        $content = $this->readSourceBytes($source);
+        $source = $this->handlePath($pathPrefix, $path); // re-resolves + re-validates (404 stays 404)
 
-        if (config()->boolean('image-transform-url.cache.enabled')) {
-            $this->cacheOriginalBytes($pathPrefix, $path, static::parseOptions($rawOptions), $content);
-        }
+        $url = $source->type === 'disk'
+            ? Storage::disk((string) $source->disk)->url($source->path)
+            : Storage::url($source->path);
 
-        return new ImageResult(
-            content: $content,
-            mimeType: $source->mime,
-            cacheHit: false,
-        );
-    }
-
-    /**
-     * Persist raw original bytes under the transform cache path (mirrors the
-     * vendor storeCachedImage() but skips encoding), and set the flag the base
-     * checks on read. The stored file keeps its extension, so mime detection
-     * on the next HIT resolves correctly.
-     */
-    protected function cacheOriginalBytes(?string $pathPrefix, ?string $path, array $options, string $bytes): void
-    {
-        $disk = Storage::disk(config()->string('image-transform-url.cache.disk'));
-        $disk->put($this->getCacheEndPath($pathPrefix, $path, $options), $bytes);
-
-        Cache::put(
-            key: 'image-transform-url:'.$this->getCachePath($pathPrefix, $path, $options),
-            value: true,
-            ttl: config()->integer('image-transform-url.cache.lifetime'),
-        );
+        throw new HttpResponseException(redirect()->away($url));
     }
 
     /**
@@ -170,25 +151,28 @@ class TransformImageAction extends BaseTransformImageAction
     /**
      * Cheap pre-flight guard: skip the Imagick attempt when the source is too
      * large, since decoding a big animation can exhaust memory_limit as an
-     * uncatchable PHP fatal that try/catch cannot recover from. Uses the raw
-     * source byte size (already in memory) — a simple, predictable proxy.
-     * Tunable via config image-transform-url.max_animated_bytes (default 10 MB,
+     * uncatchable PHP fatal that try/catch cannot recover from. Reads the size
+     * from storage metadata (no download) — a simple, predictable proxy.
+     * Tunable via config image-transform-url.max_animated_bytes (default 5 MB,
      * env IMAGE_TRANSFORM_MAX_ANIMATED_BYTES); 0 disables. Comfortably allows
      * the ~3 MB production repro file; lower it if memory_limit is tight.
      */
-    protected function animatedSourceTooLarge(string $bytes): bool
+    protected function sourceTooLarge(ImageSource $source): bool
     {
-        $max = (int) config('image-transform-url.max_animated_bytes', 10 * 1024 * 1024);
+        $max = (int) config('image-transform-url.max_animated_bytes', 5 * 1024 * 1024);
         if ($max <= 0) {
             return false; // guard disabled
         }
 
-        $size = strlen($bytes);
+        $size = $source->type === 'disk'
+            ? (int) Storage::disk((string) $source->disk)->size($source->path)
+            : (int) File::size($source->path);
+
         if ($size <= $max) {
             return false;
         }
 
-        Log::warning('image-transform-url: animated source exceeds size guard, serving original', [
+        Log::warning('image-transform-url: source exceeds size guard, redirecting to original', [
             'bytes' => $size,
             'max' => $max,
         ]);
