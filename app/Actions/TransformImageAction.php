@@ -172,13 +172,13 @@ class TransformImageAction extends BaseTransformImageAction
      * large, since decoding a big animation can exhaust memory_limit as an
      * uncatchable PHP fatal that try/catch cannot recover from. Uses the raw
      * source byte size (already in memory) — a simple, predictable proxy.
-     * Env-tunable via IMAGE_TRANSFORM_MAX_ANIMATED_BYTES (default 10 MB); set 0
-     * to disable. Comfortably allows the ~3 MB production repro file; lower it
-     * if the Cloud memory_limit is tight for large animations.
+     * Tunable via config image-transform-url.max_animated_bytes (default 10 MB,
+     * env IMAGE_TRANSFORM_MAX_ANIMATED_BYTES); 0 disables. Comfortably allows
+     * the ~3 MB production repro file; lower it if memory_limit is tight.
      */
     protected function animatedSourceTooLarge(string $bytes): bool
     {
-        $max = (int) env('IMAGE_TRANSFORM_MAX_ANIMATED_BYTES', 10 * 1024 * 1024);
+        $max = (int) config('image-transform-url.max_animated_bytes', 10 * 1024 * 1024);
         if ($max <= 0) {
             return false; // guard disabled
         }

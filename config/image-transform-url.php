@@ -146,4 +146,20 @@ return [
     'headers' => [
         'Cache-Control' => env('IMAGE_TRANSFORM_HEADER_CACHE_CONTROL', 'immutable, public, max-age=2592000, s-maxage=2592000'),
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Animated Fallback Guard (app extension)
+    |--------------------------------------------------------------------------
+    |
+    | The default GD driver cannot decode animated WebP; the app falls back to
+    | an Imagick transform. Decoding a very large animation can exhaust
+    | memory_limit as an uncatchable PHP fatal, so sources larger than this
+    | many bytes are served as-is instead of attempting the transform. Set to
+    | 0 to disable the guard. Note: file size is a proxy — a large animation
+    | decodes to much more in RAM; lower this if memory_limit is tight.
+    |
+    */
+
+    'max_animated_bytes' => (int) env('IMAGE_TRANSFORM_MAX_ANIMATED_BYTES', 10 * 1024 * 1024),
 ];
