@@ -46,6 +46,20 @@ it('still transforms static images', function () {
     expect($res->headers->get('Content-Type'))->toBe('image/webp');
 });
 
+it('redirects to the original when the animation exceeds the frame limit', function () {
+    config()->set('image-transform-url.max_animated_frames', 2); // fixture has 3 frames
+    Storage::disk('s3')->putFileAs(
+        'dir',
+        new TestingFile('many.webp', fopen(base_path('tests/fixtures/animated-tiny.webp'), 'r')),
+        'many.webp',
+    );
+
+    $res = $this->get('/production/width=64,format=webp/dir/many.webp');
+
+    $res->assertRedirect(); // over the cap -> redirect to original, not a heavy decode
+    expect($res->headers->get('Location'))->toContain('many.webp');
+});
+
 it('redirects to the original when the source cannot be decoded', function () {
     // Valid WebP header so the mime gate passes, but a garbage payload that even
     // Imagick cannot decode -> the failure must not become a 500.

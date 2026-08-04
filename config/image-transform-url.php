@@ -146,4 +146,20 @@ return [
     'headers' => [
         'Cache-Control' => env('IMAGE_TRANSFORM_HEADER_CACHE_CONTROL', 'immutable, public, max-age=2592000, s-maxage=2592000'),
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Max Animated Frames (app extension)
+    |--------------------------------------------------------------------------
+    |
+    | Animations with more frames than this are redirected to the original
+    | instead of being transformed. Imagick coalesces every frame at full
+    | canvas, so a long animation can consume GBs of RAM — an uncatchable OOM.
+    | Rough cost at 1280px width: ~8.5 MB RAM and ~130 ms per frame (e.g. 100
+    | frames ≈ 850 MB / 14 s; 209 frames ≈ 1.8 GB / 27 s). Tune against the
+    | server's memory_limit and request timeout. Set to 0 to disable the guard.
+    |
+    */
+
+    'max_animated_frames' => (int) env('IMAGE_TRANSFORM_MAX_ANIMATED_FRAMES', 100),
 ];
