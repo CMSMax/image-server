@@ -46,6 +46,21 @@ it('still transforms static images', function () {
     expect($res->headers->get('Content-Type'))->toBe('image/webp');
 });
 
+it('does not upscale beyond the source size', function () {
+    // static.png is 32x32; request a larger width -> output must stay 32 wide.
+    Storage::disk('s3')->putFileAs(
+        'dir',
+        new TestingFile('small.png', fopen(base_path('tests/fixtures/static.png'), 'r')),
+        'small.png',
+    );
+
+    $res = $this->get('/production/width=512,format=webp/dir/small.png');
+
+    $res->assertOk();
+    $size = getimagesizefromstring($res->getContent());
+    expect($size[0])->toBe(32); // clamped to native width, not enlarged to 512
+});
+
 it('redirects to the original when the animation exceeds the frame limit', function () {
     config()->set('image-transform-url.max_animated_frames', 2); // fixture has 3 frames
     Storage::disk('s3')->putFileAs(
