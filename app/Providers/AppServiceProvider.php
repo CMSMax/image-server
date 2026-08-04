@@ -13,7 +13,7 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        // Resolve the vendor transform action to our fallback-aware subclass.
+        // Resolve the vendor transform action to our failure-aware subclass.
         // Controllers method-inject the vendor FQCN, so this makes them use ours.
         $this->app->bind(BaseTransformImageAction::class, TransformImageAction::class);
     }
