@@ -72,9 +72,10 @@ class TransformImageAction extends BaseTransformImageAction
         $options = static::parseOptions($rawOptions);
         $bytes = $this->readSourceBytes($source);
 
-        // Pre-flight OOM guard: an unbounded animated upscale can exhaust
-        // memory_limit -> uncatchable PHP fatal, defeating the safety net.
-        if ($this->animatedBudgetExceeded($bytes, $options)) {
+        // Pre-flight OOM guard: decoding a large animation in Imagick can exhaust
+        // memory_limit -> uncatchable PHP fatal, defeating the safety net. Cap on
+        // source size (cheap, already in memory) instead of risking the attempt.
+        if ($this->animatedSourceTooLarge($bytes)) {
             return $this->serveOriginal($pathPrefix, $path, $rawOptions);
         }
 
@@ -167,58 +168,31 @@ class TransformImageAction extends BaseTransformImageAction
     }
 
     /**
-     * Cheap pre-flight check for whether an Imagick transform would blow the
-     * memory budget. Uses pingImageBlob() (header-only, no pixel decode) to get
-     * frame count + source dimensions, then estimates output frame-pixels.
-     * Threshold is env-tunable (IMAGE_TRANSFORM_MAX_ANIMATED_PIXELS); over it we
-     * skip Imagick and serve the original instead of risking a fatal OOM.
+     * Cheap pre-flight guard: skip the Imagick attempt when the source is too
+     * large, since decoding a big animation can exhaust memory_limit as an
+     * uncatchable PHP fatal that try/catch cannot recover from. Uses the raw
+     * source byte size (already in memory) — a simple, predictable proxy.
+     * Env-tunable via IMAGE_TRANSFORM_MAX_ANIMATED_BYTES (default 10 MB); set 0
+     * to disable. Comfortably allows the ~3 MB production repro file; lower it
+     * if the Cloud memory_limit is tight for large animations.
      */
-    protected function animatedBudgetExceeded(string $bytes, array $options): bool
+    protected function animatedSourceTooLarge(string $bytes): bool
     {
-        $max = (int) env('IMAGE_TRANSFORM_MAX_ANIMATED_PIXELS', 250_000_000);
+        $max = (int) env('IMAGE_TRANSFORM_MAX_ANIMATED_BYTES', 10 * 1024 * 1024);
         if ($max <= 0) {
             return false; // guard disabled
         }
 
-        try {
-            $ping = new \Imagick;
-            $ping->pingImageBlob($bytes);
-            $frames = max(1, $ping->getNumberImages());
-            $srcW = max(1, $ping->getImageWidth());
-            $srcH = max(1, $ping->getImageHeight());
-            $ping->clear();
-        } catch (Throwable) {
-            return false; // cannot measure -> let the transform attempt proceed
+        $size = strlen($bytes);
+        if ($size <= $max) {
+            return false;
         }
 
-        if ($frames <= 1) {
-            return false; // not animated; GD-equivalent memory profile
-        }
+        Log::warning('image-transform-url: animated source exceeds size guard, serving original', [
+            'bytes' => $size,
+            'max' => $max,
+        ]);
 
-        $reqW = $this->getPositiveIntOptionValue($options, 'width');
-        $reqH = $this->getPositiveIntOptionValue($options, 'height');
-
-        // Estimate output dimensions the same way the scale() call would.
-        [$outW, $outH] = match (true) {
-            $reqW && $reqH => [$reqW, $reqH],
-            (bool) $reqW => [$reqW, (int) round($srcH * $reqW / $srcW)],
-            (bool) $reqH => [(int) round($srcW * $reqH / $srcH), $reqH],
-            default => [$srcW * 2, $srcH * 2],
-        };
-
-        $budget = $frames * max(1, $outW) * max(1, $outH);
-
-        if ($budget > $max) {
-            Log::warning('image-transform-url: animated Imagick guard tripped, serving original', [
-                'frames' => $frames,
-                'output' => $outW.'x'.$outH,
-                'budget' => $budget,
-                'max' => $max,
-            ]);
-
-            return true;
-        }
-
-        return false;
+        return true;
     }
 }

@@ -67,11 +67,11 @@ it('still transforms static images via the default driver', function () {
     expect($res->headers->get('Content-Type'))->toBe('image/webp');
 });
 
-it('serves the original when the animated pixel budget is exceeded', function () {
-    // Force the OOM guard to trip on the tiny 3-frame fixture.
+it('serves the original when the animated source exceeds the size guard', function () {
+    // Force the OOM size guard to trip on the tiny 3-frame fixture (1-byte cap).
     config()->set('image-transform-url.cache.enabled', false);
-    putenv('IMAGE_TRANSFORM_MAX_ANIMATED_PIXELS=1');
-    $_ENV['IMAGE_TRANSFORM_MAX_ANIMATED_PIXELS'] = '1';
+    putenv('IMAGE_TRANSFORM_MAX_ANIMATED_BYTES=1');
+    $_ENV['IMAGE_TRANSFORM_MAX_ANIMATED_BYTES'] = '1';
 
     Storage::disk('s3')->putFileAs(
         'dir',
@@ -86,6 +86,6 @@ it('serves the original when the animated pixel budget is exceeded', function ()
     // and the byte length matches the original fixture, not a re-encode.
     expect($res->getContent())->toBe((string) file_get_contents(base_path('tests/fixtures/animated-tiny.webp')));
 
-    putenv('IMAGE_TRANSFORM_MAX_ANIMATED_PIXELS');
-    unset($_ENV['IMAGE_TRANSFORM_MAX_ANIMATED_PIXELS']);
+    putenv('IMAGE_TRANSFORM_MAX_ANIMATED_BYTES');
+    unset($_ENV['IMAGE_TRANSFORM_MAX_ANIMATED_BYTES']);
 });
