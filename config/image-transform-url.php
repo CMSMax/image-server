@@ -161,5 +161,5 @@ return [
     |
     */
 
-    'max_animated_bytes' => (int) env('IMAGE_TRANSFORM_MAX_ANIMATED_BYTES', 10 * 1024 * 1024),
+    'max_animated_bytes' => (int) env('IMAGE_TRANSFORM_MAX_ANIMATED_BYTES', 5 * 1024 * 1024),
 ];
