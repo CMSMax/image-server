@@ -30,14 +30,21 @@ use Throwable;
  *  2. Failure fallback: a still-undecodable source (or encoder error) redirects
  *     to the original rather than returning a 500.
  *
- * Both redirects are rate-limited and carry the configured cache headers so the
- * CDN absorbs repeats. Bound over the vendor FQCN in AppServiceProvider.
+ * It also serves cached transforms with disk-native reads so an S3 cache disk
+ * works (the vendor reads the cache via the local File:: facade, which always
+ * misses on an S3 key). Both redirects are rate-limited and carry the configured
+ * cache headers so the CDN absorbs repeats. Bound over the vendor FQCN in
+ * AppServiceProvider.
  */
 class TransformImageAction extends BaseTransformImageAction
 {
     public function handle(?string $ip, ?string $pathPrefix, string $options, ?string $path = null): ImageResult
     {
         try {
+            if ($cached = $this->servedFromCache($pathPrefix, $path, $options)) {
+                return $cached; // disk-native cache read — works for S3 (the vendor's File:: read does not)
+            }
+
             $this->guardAnimatedFrames($ip, $pathPrefix, $path, $options); // may throttle + redirect
 
             return parent::handle($ip, $pathPrefix, $options, $path);
@@ -63,10 +70,6 @@ class TransformImageAction extends BaseTransformImageAction
         $max = (int) config('image-transform-url.max_animated_frames', 0);
         if ($max <= 0) {
             return; // guard disabled
-        }
-
-        if ($this->isAlreadyCached($pathPrefix, $path, $rawOptions)) {
-            return; // a cached transform will be served; no fresh decode ahead
         }
 
         // Validate + resolve by content mime (extension is caller-controlled).
@@ -120,18 +123,39 @@ class TransformImageAction extends BaseTransformImageAction
     }
 
     /**
-     * Whether the transform is already cached (mirrors the vendor cache check).
-     * Cheap — no download — so cache hits skip the frame guard entirely.
+     * Serve a cached transform read with disk-native operations, so it works on
+     * any cache disk — including S3, where the vendor's `File::exists()` gate
+     * (local filesystem) always misses on the S3 key. Returns null on a miss,
+     * which lets the guard run and the vendor transform + store as usual (the
+     * vendor's `$disk->put()` write is already S3-compatible). The cheap local
+     * cache-flag is checked first, so a miss costs no S3 round-trip.
      */
-    protected function isAlreadyCached(?string $pathPrefix, ?string $path, string $rawOptions): bool
+    protected function servedFromCache(?string $pathPrefix, ?string $path, string $rawOptions): ?ImageResult
     {
         if (! config()->boolean('image-transform-url.cache.enabled')) {
-            return false;
+            return null;
         }
 
-        $cachePath = $this->getCachePath($pathPrefix, $path, static::parseOptions($rawOptions));
+        $options = static::parseOptions($rawOptions);
 
-        return File::exists($cachePath) && Cache::has('image-transform-url:'.$cachePath);
+        if (! Cache::has('image-transform-url:'.$this->getCachePath($pathPrefix, $path, $options))) {
+            return null; // not cached, or the TTL flag has expired
+        }
+
+        $disk = Storage::disk(config()->string('image-transform-url.cache.disk'));
+        $endPath = $this->getCacheEndPath($pathPrefix, $path, $options);
+
+        if (! $disk->exists($endPath)) {
+            return null; // flag set but object evicted — treat as a miss
+        }
+
+        $bytes = (string) $disk->get($endPath);
+
+        return new ImageResult(
+            content: $bytes,
+            mimeType: (new \finfo(FILEINFO_MIME_TYPE))->buffer($bytes) ?: 'application/octet-stream',
+            cacheHit: true,
+        );
     }
 
     /**

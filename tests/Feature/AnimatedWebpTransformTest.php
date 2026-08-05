@@ -115,17 +115,20 @@ it('preserves a 404 for a missing object', function () {
     $this->get('/production/width=64,format=webp/dir/missing.webp')->assertNotFound();
 });
 
-it('serves a cached transform even after the frame cap is tightened', function () {
-    // Seeds the vendor cache directly, then tightens the cap: isAlreadyCached()
-    // must skip the guard so the cached bytes are served (no redirect, no decode).
-    Storage::fake('local'); // cache disk
+it('serves a cached transform from a non-local (s3) cache disk', function () {
+    // Reads the cache disk-natively so an S3 cache disk works (the vendor's
+    // File:: read always misses on an S3 key). Seeds the cache on the configured
+    // disk, then requests: the cached bytes are served (200 + X-Cache HIT) and
+    // the guard is skipped even though the cap is below the file's frame count.
+    Storage::fake('s3-cache');
     config()->set('image-transform-url.cache.enabled', true);
+    config()->set('image-transform-url.cache.disk', 's3-cache');
     config()->set('image-transform-url.max_animated_frames', 2); // would redirect the 3-frame file
 
     $parsed = ['width' => 64, 'format' => 'webp'];
     $endPath = '_cache/image-transform-url/production/'.md5(json_encode($parsed)).'_dir/a.webp';
-    Storage::disk('local')->put($endPath, 'SEEDED-CACHE-BODY');
-    Cache::put('image-transform-url:'.Storage::disk('local')->path($endPath), true, 3600);
+    Storage::disk('s3-cache')->put($endPath, 'SEEDED-CACHE-BODY');
+    Cache::put('image-transform-url:'.Storage::disk('s3-cache')->path($endPath), true, 3600);
     putFixture('animated-tiny.webp', 'dir/a.webp');
 
     $res = $this->get('/production/width=64,format=webp/dir/a.webp');
