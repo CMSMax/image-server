@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "efe1ea6c1274b79c88755ea6e9c1170e",
+    "content-hash": "3030024190ff8b5604eb86258378e62c",
     "packages": [
         {
             "name": "ace-of-aces/laravel-image-transform-url",
@@ -10048,7 +10048,8 @@
     "prefer-stable": true,
     "prefer-lowest": false,
     "platform": {
-        "php": "^8.2"
+        "php": "^8.2",
+        "ext-imagick": "*"
     },
     "platform-dev": {},
     "plugin-api-version": "2.9.0"
