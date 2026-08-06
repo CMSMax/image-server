@@ -59,6 +59,11 @@ return [
     | Here you may configure the options which are enabled for the image
     | transformer.
     |
+    | NOTE: requested width/height are NOT clamped to the source size — the
+    | vendor calls scale(), which enlarges, so a request larger than the source
+    | is upscaled. This is intentional: a clamp was added in a552c90 and
+    | deliberately reverted in 4341296.
+    |
     */
 
     'enabled_options' => env('IMAGE_TRANSFORM_ENABLED_OPTIONS', [

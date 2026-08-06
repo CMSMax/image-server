@@ -200,6 +200,54 @@ it('serves the cache on the default (no-prefix) route', function () {
     expect($res->getContent())->toBe('SEEDED-DEFAULT-ROUTE');
 });
 
+it('evicts on a local cache disk so it stays bounded', function () {
+    // A local disk has no bucket lifecycle rule, so the vendor size sweep must
+    // still run — otherwise the shipped default configuration grows unbounded.
+    Storage::fake('local');
+    config()->set('image-transform-url.cache.enabled', true);
+    config()->set('image-transform-url.cache.disk', 'local');
+    config()->set('image-transform-url.cache.max_size_mb', 0); // hardest possible cap
+
+    for ($i = 0; $i < 5; $i++) {
+        putFixture('static.png', "dir/e{$i}.png");
+        $this->get("/production/width=3{$i},format=webp/dir/e{$i}.png")->assertOk();
+    }
+
+    expect(Storage::disk('local')->allFiles('_cache/image-transform-url'))->toBeEmpty();
+});
+
+it('skips the O(N) sweep on an s3 cache disk', function () {
+    // manageCacheSize() LISTs + HEADs the whole cache dir per write — billed
+    // round-trips on an object store. Objects must survive even under a zero cap.
+    Storage::fake('s3-cache');
+    config()->set('image-transform-url.cache.enabled', true);
+    config()->set('image-transform-url.cache.disk', 's3-cache');
+    config()->set('image-transform-url.cache.max_size_mb', 0);
+
+    Storage::disk('s3-cache')->put('_cache/image-transform-url/production/seed.webp', str_repeat('x', 4096));
+    putFixture('static.png', 'dir/keep.png');
+
+    $this->get('/production/width=32,format=webp/dir/keep.png')->assertOk();
+
+    // Pre-existing object untouched + the new one written = no eviction ran.
+    expect(Storage::disk('s3-cache')->allFiles('_cache/image-transform-url'))->toHaveCount(2);
+});
+
+it('runs the sweep for an unlisted driver so it fails safe', function () {
+    // The gate is "not s3", not "is local": an unknown driver must get the
+    // bounded sweep rather than unbounded growth with no lifecycle rule.
+    Storage::fake('odd'); // usable local fake…
+    config()->set('filesystems.disks.odd.driver', 'sftp'); // …but the config says sftp
+    config()->set('image-transform-url.cache.enabled', true);
+    config()->set('image-transform-url.cache.disk', 'odd');
+    config()->set('image-transform-url.cache.max_size_mb', 0);
+
+    putFixture('static.png', 'dir/odd.png');
+    $this->get('/production/width=32,format=webp/dir/odd.png')->assertOk();
+
+    expect(Storage::disk('odd')->allFiles('_cache/image-transform-url'))->toBeEmpty();
+});
+
 it('404s a deleted source even while a stale transform is cached', function () {
     // The source is resolved/validated before the cache read, so a takedown takes
     // effect immediately instead of being served for the full cache lifetime.

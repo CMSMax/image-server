@@ -194,9 +194,12 @@ class TransformImageAction extends BaseTransformImageAction
      * suppress it (that suppression was the production low-hit-rate /
      * CPU-scales-with-replicas failure). manageCacheSize() LISTs + HEADs the whole
      * cache dir on every write: cheap local stat()s, but O(N) billed round-trips
-     * that peg CPU on an object store — so it is skipped for non-local disks, which
-     * should be bounded by a bucket lifecycle rule instead. A local disk has no such
-     * rule, so it still needs the sweep to stay within cache.max_size_mb.
+     * that peg CPU on an object store — so it is skipped for S3, which should be
+     * bounded by a bucket lifecycle rule instead (see README).
+     *
+     * The check is "not s3" rather than "is local" so it fails safe: an unlisted
+     * driver gets the slow-but-bounded sweep instead of unbounded growth with no
+     * lifecycle rule to fall back on.
      */
     protected function storeCachedImage(?string $pathPrefix, ?string $path, array $options, EncodedImageInterface $encoded): void
     {
@@ -210,7 +213,7 @@ class TransformImageAction extends BaseTransformImageAction
             ttl: config()->integer('image-transform-url.cache.lifetime'),
         );
 
-        if (config()->string("filesystems.disks.{$diskName}.driver") === 'local') {
+        if (config("filesystems.disks.{$diskName}.driver") !== 's3') {
             $this->manageCacheSize();
         }
     }
