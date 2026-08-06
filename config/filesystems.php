@@ -55,6 +55,7 @@ return [
             'bucket' => env('AWS_BUCKET'),
             'url' => env('AWS_URL'),
             'endpoint' => env('AWS_ENDPOINT'),
+            'root' => env('AWS_ROOT', ''),
             'use_path_style_endpoint' => env('AWS_USE_PATH_STYLE_ENDPOINT', false),
             'throw' => false,
             'report' => false,
@@ -73,6 +74,18 @@ return [
             'report' => false,
         ],
 
+        's3-cache' => [
+            'driver' => 's3',
+            'key' => env('AWS_ACCESS_KEY_ID_CACHE'),
+            'secret' => env('AWS_SECRET_ACCESS_KEY_CACHE'),
+            'region' => env('AWS_DEFAULT_REGION_CACHE'),
+            'bucket' => env('AWS_BUCKET_CACHE'),
+            'url' => env('AWS_URL_CACHE'),
+            'endpoint' => env('AWS_ENDPOINT_CACHE'),
+            'use_path_style_endpoint' => env('AWS_USE_PATH_STYLE_ENDPOINT_CACHE', false),
+            'throw' => false,
+            'report' => false,
+        ],
     ],
 
     /*
