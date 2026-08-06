@@ -115,6 +115,24 @@ it('preserves a 404 for a missing object', function () {
     $this->get('/production/width=64,format=webp/dir/missing.webp')->assertNotFound();
 });
 
+it('stores the flag on a real transform so the next request is a cache HIT', function () {
+    // End-to-end (no seeding): the transform stores the object AND writes the flag,
+    // so the second request hits. Regression for the low-hit-rate bug — the flag is
+    // written before (removed) size management, so nothing can suppress it.
+    Storage::fake('s3-cache');
+    config()->set('image-transform-url.cache.enabled', true);
+    config()->set('image-transform-url.cache.disk', 's3-cache');
+    putFixture('static.png', 'dir/store.png');
+
+    $first = $this->get('/production/width=32,format=webp/dir/store.png');
+    $first->assertOk();
+    expect($first->headers->get('X-Cache'))->toBe('MISS');
+
+    $second = $this->get('/production/width=32,format=webp/dir/store.png');
+    $second->assertOk();
+    expect($second->headers->get('X-Cache'))->toBe('HIT');
+});
+
 it('serves the cache on the default (no-prefix) route', function () {
     // The default route resolves under 'production'; the source is resolved first
     // so $pathPrefix is normalised before the cache read — otherwise the read key

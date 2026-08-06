@@ -87,16 +87,18 @@ return [
 
     'cache' => [
         'enabled' => env('IMAGE_TRANSFORM_CACHE_ENABLED', true),
-        // NOTE: env() returns numeric vars as strings; the vendor reads these via
-        // config()->integer(), which strictly rejects strings — so cast here.
-        'lifetime' => (int) env('IMAGE_TRANSFORM_CACHE_LIFETIME', 60 * 24 * 30), // 30 days
+        // TTL (seconds) of the "live" cache flag and the frame-count memo. NOTE:
+        // env() returns numeric vars as strings; read via config()->integer(), which
+        // strictly rejects strings — so cast here.
+        'lifetime' => (int) env('IMAGE_TRANSFORM_CACHE_LIFETIME', 60 * 60 * 24 * 30), // 30 days
         'disk' => env('IMAGE_TRANSFORM_CACHE_DISK', 'local'),
+        // Kept for package compatibility (the vendor reads these via config()->integer()),
+        // but INERT here: our TransformImageAction disables the vendor's size management
+        // because it costs O(N) billed S3/R2 round-trips on every write. Evict the cache
+        // disk with a bucket lifecycle rule instead. Cast to int so an env-provided
+        // string can't trip config()->integer().
         'max_size_mb' => (int) env('IMAGE_TRANSFORM_CACHE_MAX_SIZE_MB', 500000), // 500 GB
         'clear_to_percent' => (int) env('IMAGE_TRANSFORM_CACHE_CLEAR_TO_PERCENT', 80), // 80% of max size
-        // Size management LISTs+HEADs the whole cache dir on every write — cheap on
-        // a local disk, but O(N) billed round-trips on S3/R2. Disable it for an
-        // object-store cache disk and evict via a bucket lifecycle rule instead.
-        'manage_size' => env('IMAGE_TRANSFORM_CACHE_MANAGE_SIZE', true),
     ],
 
     /*

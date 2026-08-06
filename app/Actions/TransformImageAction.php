@@ -182,21 +182,19 @@ class TransformImageAction extends BaseTransformImageAction
     }
 
     /**
-     * Store the transform, but skip the vendor's size management on object-store
-     * cache disks. manageCacheSize() LISTs + HEADs the whole cache dir on every
-     * write — cheap local stat()s, but O(N) billed round-trips on S3/R2. Gate it
-     * behind cache.manage_size (default on) and evict via a bucket lifecycle rule
-     * instead. Mirrors the vendor's put + flag write.
+     * Store the transform: write the object, then set the live flag. The vendor's
+     * size management is intentionally NOT run — manageCacheSize() LISTs + HEADs the
+     * whole cache dir on every write, which is O(N) billed round-trips on an S3/R2
+     * cache that peg CPU and stall workers as it grows (the production low-hit-rate
+     * / CPU-scales-with-replicas failure). Evict via a bucket lifecycle rule
+     * instead. The flag is written last so nothing can suppress it before
+     * servedFromCache() can find it.
      */
     protected function storeCachedImage(?string $pathPrefix, ?string $path, array $options, EncodedImageInterface $encoded): void
     {
         $disk = Storage::disk(config()->string('image-transform-url.cache.disk'));
 
         $disk->put($this->getCacheEndPath($pathPrefix, $path, $options), $encoded->toString());
-
-        if (config()->boolean('image-transform-url.cache.manage_size', true)) {
-            $this->manageCacheSize();
-        }
 
         Cache::put(
             key: 'image-transform-url:'.$this->getCachePath($pathPrefix, $path, $options),
