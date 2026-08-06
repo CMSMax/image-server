@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Storage;
+use Intervention\Image\Laravel\Facades\Image;
 
 /**
  * Regression coverage for the image-transform guards.
@@ -109,6 +110,51 @@ it('redirects to the original when the source cannot be decoded', function () {
 
     $res->assertRedirect();
     expect($res->headers->get('Location'))->toContain('broken.webp');
+});
+
+it('redirects to the original when the encoder throws a raw ImagickException', function () {
+    // Intervention's Imagick encoders don't wrap ImagickException (only the decoders
+    // do), so an encode-stage fault (e.g. CacheResourcesExhausted under a memory /
+    // policy.xml limit) must still fall back to a redirect, not a 500. ImageManager
+    // is final (not Mockery-mockable), so swap the facade with a duck-typed fake.
+    putFixture('static.png', 'dir/enc.png');
+
+    $fakeImage = new class
+    {
+        public function width(): int
+        {
+            return 32;
+        }
+
+        public function height(): int
+        {
+            return 32;
+        }
+
+        public function scale(...$a): self
+        {
+            return $this;
+        }
+
+        public function encode(...$a): mixed
+        {
+            throw new ImagickException('CacheResourcesExhausted');
+        }
+    };
+    Image::swap(new class($fakeImage)
+    {
+        public function __construct(private object $img) {}
+
+        public function read(...$a): object
+        {
+            return $this->img;
+        }
+    });
+
+    $res = $this->get('/production/width=32,format=webp/dir/enc.png');
+
+    $res->assertRedirect();
+    expect($res->headers->get('Location'))->toContain('enc.png');
 });
 
 it('preserves a 404 for a missing object', function () {

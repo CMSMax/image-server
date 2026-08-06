@@ -92,10 +92,13 @@ return [
         // strictly rejects strings — so cast here.
         'lifetime' => (int) env('IMAGE_TRANSFORM_CACHE_LIFETIME', 60 * 60 * 24 * 30), // 30 days
         'disk' => env('IMAGE_TRANSFORM_CACHE_DISK', 'local'),
-        // Kept for package compatibility (the vendor reads these via config()->integer())
-        // But we will not use those since we use S3 Storage
-        'max_size_mb' => (int) env('IMAGE_TRANSFORM_CACHE_MAX_SIZE_MB', 500000), // 500 GB
-        'clear_to_percent' => (int) env('IMAGE_TRANSFORM_CACHE_CLEAR_TO_PERCENT', 80), // 80% of max size
+        // Size management (max_size_mb / clear_to_percent) is enforced ONLY on a
+        // local cache disk — see storeCachedImage(). On an object store (s3/R2) the
+        // O(N) LIST+HEAD sweep is skipped (it pegs CPU); bound that bucket with a
+        // lifecycle rule instead, where these two values do nothing. Cast to int so
+        // an env-provided string can't trip the vendor's config()->integer().
+        'max_size_mb' => (int) env('IMAGE_TRANSFORM_CACHE_MAX_SIZE_MB', 100), // 100 MB (local disk only)
+        'clear_to_percent' => (int) env('IMAGE_TRANSFORM_CACHE_CLEAR_TO_PERCENT', 80), // clear to 80% of max
     ],
 
     /*

@@ -68,8 +68,13 @@ class TransformImageAction extends BaseTransformImageAction
             throw $redirect; // our redirect — propagate as-is
         } catch (HttpExceptionInterface $e) {
             throw $e; // preserve HTTP control-flow (404 not-found, 429 rate-limit, etc.)
-        } catch (DecoderException|EncoderException|NotSupportedException $e) {
-            report($e); // decode/encode failure only — serve the original instead of a 500
+        } catch (DecoderException|EncoderException|NotSupportedException|\ImagickException $e) {
+            // Decode/encode failure — serve the original instead of a 500. Intervention
+            // wraps decode faults in DecoderException, but its Imagick encoders throw
+            // ImagickException bare (e.g. CacheResourcesExhausted under a policy.xml /
+            // memory limit), so catch that too. ImagickException only originates from
+            // Imagick ops, so genuine faults (S3, config, TypeError) still surface as 5xx.
+            report($e);
             $this->redirectToOriginal($source); // throws HttpResponseException
         }
     }
@@ -182,25 +187,32 @@ class TransformImageAction extends BaseTransformImageAction
     }
 
     /**
-     * Store the transform: write the object, then set the live flag. The vendor's
-     * size management is intentionally NOT run — manageCacheSize() LISTs + HEADs the
-     * whole cache dir on every write, which is O(N) billed round-trips on an S3/R2
-     * cache that peg CPU and stall workers as it grows (the production low-hit-rate
-     * / CPU-scales-with-replicas failure). Evict via a bucket lifecycle rule
-     * instead. The flag is written last so nothing can suppress it before
-     * servedFromCache() can find it.
+     * Store the transform: write the object, set the live flag, then run size
+     * management ONLY on a local cache disk.
+     *
+     * The flag is written before the sweep so a slow/failing sweep can never
+     * suppress it (that suppression was the production low-hit-rate /
+     * CPU-scales-with-replicas failure). manageCacheSize() LISTs + HEADs the whole
+     * cache dir on every write: cheap local stat()s, but O(N) billed round-trips
+     * that peg CPU on an object store — so it is skipped for non-local disks, which
+     * should be bounded by a bucket lifecycle rule instead. A local disk has no such
+     * rule, so it still needs the sweep to stay within cache.max_size_mb.
      */
     protected function storeCachedImage(?string $pathPrefix, ?string $path, array $options, EncodedImageInterface $encoded): void
     {
-        $disk = Storage::disk(config()->string('image-transform-url.cache.disk'));
+        $diskName = config()->string('image-transform-url.cache.disk');
 
-        $disk->put($this->getCacheEndPath($pathPrefix, $path, $options), $encoded->toString());
+        Storage::disk($diskName)->put($this->getCacheEndPath($pathPrefix, $path, $options), $encoded->toString());
 
         Cache::put(
             key: 'image-transform-url:'.$this->getCachePath($pathPrefix, $path, $options),
             value: true,
             ttl: config()->integer('image-transform-url.cache.lifetime'),
         );
+
+        if (config()->string("filesystems.disks.{$diskName}.driver") === 'local') {
+            $this->manageCacheSize();
+        }
     }
 
     /**
