@@ -115,6 +115,58 @@ it('preserves a 404 for a missing object', function () {
     $this->get('/production/width=64,format=webp/dir/missing.webp')->assertNotFound();
 });
 
+it('serves the cache on the default (no-prefix) route', function () {
+    // The default route resolves under 'production'; the source is resolved first
+    // so $pathPrefix is normalised before the cache read — otherwise the read key
+    // ('//...') never matches the vendor's write key ('/production/...').
+    Storage::fake('s3-cache');
+    config()->set('image-transform-url.cache.enabled', true);
+    config()->set('image-transform-url.cache.disk', 's3-cache');
+
+    $parsed = ['width' => 64, 'format' => 'webp'];
+    $endPath = '_cache/image-transform-url/production/'.md5(json_encode($parsed)).'_dir/a.webp';
+    Storage::disk('s3-cache')->put($endPath, 'SEEDED-DEFAULT-ROUTE');
+    Cache::put('image-transform-url:'.Storage::disk('s3-cache')->path($endPath), true, 3600);
+    putFixture('animated-tiny.webp', 'dir/a.webp');
+
+    $res = $this->get('/width=64,format=webp/dir/a.webp'); // no prefix
+
+    $res->assertOk();
+    expect($res->headers->get('X-Cache'))->toBe('HIT');
+    expect($res->getContent())->toBe('SEEDED-DEFAULT-ROUTE');
+});
+
+it('404s a deleted source even while a stale transform is cached', function () {
+    // The source is resolved/validated before the cache read, so a takedown takes
+    // effect immediately instead of being served for the full cache lifetime.
+    Storage::fake('s3-cache');
+    config()->set('image-transform-url.cache.enabled', true);
+    config()->set('image-transform-url.cache.disk', 's3-cache');
+
+    $parsed = ['width' => 64, 'format' => 'webp'];
+    $endPath = '_cache/image-transform-url/production/'.md5(json_encode($parsed)).'_dir/gone.webp';
+    Storage::disk('s3-cache')->put($endPath, 'STALE-BODY');
+    Cache::put('image-transform-url:'.Storage::disk('s3-cache')->path($endPath), true, 3600);
+    // The source object itself was never stored (deleted / unpublished).
+
+    $this->get('/production/width=64,format=webp/dir/gone.webp')->assertNotFound();
+});
+
+it('rate-limits a corrupt source instead of re-downloading it forever', function () {
+    // A corrupt source throws on the frame ping; it is treated as over-cap (the
+    // sentinel is cached) so it flows into the rate-limited redirect rather than
+    // bypassing the limiter and re-fetching the full object on every request.
+    config()->set('image-transform-url.max_animated_frames', 2);
+    config()->set('image-transform-url.rate_limit.enabled', true);
+    config()->set('image-transform-url.rate_limit.disabled_for_environments', []);
+    config()->set('image-transform-url.rate_limit.max_attempts', 1);
+    $header = substr((string) file_get_contents(base_path('tests/fixtures/animated-tiny.webp')), 0, 16);
+    Storage::disk('s3')->put('dir/corrupt.webp', $header.str_repeat("\x00", 256));
+
+    $this->get('/production/width=64,format=webp/dir/corrupt.webp')->assertRedirect();
+    $this->get('/production/width=64,format=webp/dir/corrupt.webp')->assertStatus(429);
+});
+
 it('serves a cached transform from a non-local (s3) cache disk', function () {
     // Reads the cache disk-natively so an S3 cache disk works (the vendor's
     // File:: read always misses on an S3 key). Seeds the cache on the configured

@@ -13,48 +13,64 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use Intervention\Image\Exceptions\DecoderException;
+use Intervention\Image\Exceptions\EncoderException;
+use Intervention\Image\Exceptions\NotSupportedException;
+use Intervention\Image\Interfaces\EncodedImageInterface;
 use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
-use Throwable;
 
 /**
  * Thin override of the vendor transform action.
  *
  * The app uses the Imagick driver (config/image.php), which decodes animated
- * WebP that GD cannot — fixing the reported 500. Two safety nets on top:
+ * WebP that GD cannot — fixing the reported 500. Safety nets on top:
  *
  *  1. Frame guard: transforming a long animation coalesces every frame at full
  *     canvas — GBs of RAM and tens of seconds (an uncatchable OOM / timeout).
  *     Animations with more than max_animated_frames are redirected to the
  *     original. Gated on the DETECTED mime (not the caller-controlled name); the
- *     frame count is an Imagick header ping cached by disk+path+mtime.
+ *     frame count is an Imagick header ping cached by disk+path+mtime. A corrupt
+ *     source counts as over-cap (and the sentinel is cached) so it flows into the
+ *     same rate-limited redirect instead of being re-downloaded every request.
  *  2. Failure fallback: a still-undecodable source (or encoder error) redirects
- *     to the original rather than returning a 500.
+ *     to the original rather than returning a 500. Only decode/encode faults are
+ *     swallowed — genuine faults (S3, config, type errors) still surface as 5xx.
  *
  * It also serves cached transforms with disk-native reads so an S3 cache disk
  * works (the vendor reads the cache via the local File:: facade, which always
- * misses on an S3 key). Both redirects are rate-limited and carry the configured
- * cache headers so the CDN absorbs repeats. Bound over the vendor FQCN in
- * AppServiceProvider.
+ * misses on an S3 key). The source is resolved/validated BEFORE the cache read
+ * so a deleted source 404s instead of serving a stale transform, and so the
+ * cache key is normalised (fixing the default/no-prefix route). Both redirects
+ * are rate-limited and carry the configured cache headers so the CDN absorbs
+ * repeats. Bound over the vendor FQCN in AppServiceProvider.
  */
 class TransformImageAction extends BaseTransformImageAction
 {
     public function handle(?string $ip, ?string $pathPrefix, string $options, ?string $path = null): ImageResult
     {
+        $source = null;
+
         try {
+            // Resolve + validate the source FIRST. This 404s a deleted/disallowed
+            // source (instead of serving a stale cache entry) and normalises
+            // $pathPrefix/$path by reference — so the cache key below matches the
+            // vendor's writer, including on the default (no-prefix) route.
+            $source = $this->handlePath($pathPrefix, $path);
+
             if ($cached = $this->servedFromCache($pathPrefix, $path, $options)) {
                 return $cached; // disk-native cache read — works for S3 (the vendor's File:: read does not)
             }
 
-            $this->guardAnimatedFrames($ip, $pathPrefix, $path, $options); // may throttle + redirect
+            $this->guardAnimatedFrames($ip, $source, (string) $path); // may throttle + redirect
 
             return parent::handle($ip, $pathPrefix, $options, $path);
         } catch (HttpResponseException $redirect) {
-            throw $redirect; // frame-guard redirect — propagate as-is
+            throw $redirect; // our redirect — propagate as-is
         } catch (HttpExceptionInterface $e) {
             throw $e; // preserve HTTP control-flow (404 not-found, 429 rate-limit, etc.)
-        } catch (Throwable $e) {
-            report($e);
-            $this->redirectToOriginal($pathPrefix, $path); // throws HttpResponseException
+        } catch (DecoderException|EncoderException|NotSupportedException $e) {
+            report($e); // decode/encode failure only — serve the original instead of a 500
+            $this->redirectToOriginal($source); // throws HttpResponseException
         }
     }
 
@@ -65,15 +81,13 @@ class TransformImageAction extends BaseTransformImageAction
      * Runs only on a cache-miss; the frame count is cached by disk+path+mtime so
      * repeat requests skip the download. Disabled when max_animated_frames <= 0.
      */
-    protected function guardAnimatedFrames(?string $ip, ?string $pathPrefix, ?string $path, string $rawOptions): void
+    protected function guardAnimatedFrames(?string $ip, ImageSource $source, string $path): void
     {
         $max = (int) config('image-transform-url.max_animated_frames', 0);
         if ($max <= 0) {
             return; // guard disabled
         }
 
-        // Validate + resolve by content mime (extension is caller-controlled).
-        $source = $this->handlePath($pathPrefix, $path); // 404 stays 404
         if (! in_array($source->mime, ['image/webp', 'image/gif'], true)) {
             return; // not an animatable format
         }
@@ -88,7 +102,7 @@ class TransformImageAction extends BaseTransformImageAction
             config()->boolean('image-transform-url.rate_limit.enabled') &&
             ! in_array(App::environment(), config()->array('image-transform-url.rate_limit.disabled_for_environments'), true)
         ) {
-            $this->rateLimit($ip, (string) $path);
+            $this->rateLimit($ip, $path);
         }
 
         Log::warning('image-transform-url: animation exceeds frame guard, redirecting to original', [
@@ -97,12 +111,15 @@ class TransformImageAction extends BaseTransformImageAction
             'path' => $source->path,
         ]);
 
-        $this->redirectToOriginal($pathPrefix, $path); // throws HttpResponseException
+        $this->redirectToOriginal($source); // throws HttpResponseException
     }
 
     /**
      * Real frame count via a header-only Imagick ping (no pixel decode), cached
      * by disk + path + last-modified so repeat requests skip the source download.
+     * A corrupt/undecodable source is treated as over-cap (PHP_INT_MAX) and the
+     * sentinel is cached, so it flows into the rate-limited redirect rather than
+     * throwing here and re-downloading the full object on every request.
      */
     protected function animationFrameCount(ImageSource $source): int
     {
@@ -113,12 +130,18 @@ class TransformImageAction extends BaseTransformImageAction
         $key = 'image-transform-url:frames:'.($source->disk ?? 'local').':'.$source->path.':'.$lastModified;
 
         return (int) Cache::remember($key, config()->integer('image-transform-url.cache.lifetime'), function () use ($source) {
-            $probe = new \Imagick;
-            $probe->pingImageBlob($this->readSourceBytes($source)); // headers only
-            $frames = max(1, $probe->getNumberImages());
-            $probe->clear();
+            try {
+                $probe = new \Imagick;
+                $probe->pingImageBlob($this->readSourceBytes($source)); // headers only
+                $frames = max(1, $probe->getNumberImages());
+                $probe->clear();
 
-            return $frames;
+                return $frames;
+            } catch (\ImagickException $e) {
+                report($e);
+
+                return PHP_INT_MAX; // undecodable -> over cap -> rate-limited redirect, and cached
+            }
         });
     }
 
@@ -159,6 +182,30 @@ class TransformImageAction extends BaseTransformImageAction
     }
 
     /**
+     * Store the transform, but skip the vendor's size management on object-store
+     * cache disks. manageCacheSize() LISTs + HEADs the whole cache dir on every
+     * write — cheap local stat()s, but O(N) billed round-trips on S3/R2. Gate it
+     * behind cache.manage_size (default on) and evict via a bucket lifecycle rule
+     * instead. Mirrors the vendor's put + flag write.
+     */
+    protected function storeCachedImage(?string $pathPrefix, ?string $path, array $options, EncodedImageInterface $encoded): void
+    {
+        $disk = Storage::disk(config()->string('image-transform-url.cache.disk'));
+
+        $disk->put($this->getCacheEndPath($pathPrefix, $path, $options), $encoded->toString());
+
+        if (config()->boolean('image-transform-url.cache.manage_size', true)) {
+            $this->manageCacheSize();
+        }
+
+        Cache::put(
+            key: 'image-transform-url:'.$this->getCachePath($pathPrefix, $path, $options),
+            value: true,
+            ttl: config()->integer('image-transform-url.cache.lifetime'),
+        );
+    }
+
+    /**
      * Read the raw source bytes for a disk- or local-based source.
      */
     protected function readSourceBytes(ImageSource $source): string
@@ -169,19 +216,20 @@ class TransformImageAction extends BaseTransformImageAction
     }
 
     /**
-     * Safety net: redirect to the original's storage/CDN URL so the client still
-     * gets an image (and the app never streams a broken/huge file through PHP).
-     * The bucket is public (see README/config), so a plain url() is correct and
-     * stays CDN-cacheable; the configured cache headers let the CDN absorb it.
-     * Throws, so the caller never falls through.
+     * Safety net: redirect to the original's public URL so the client still gets
+     * an image (and the app never streams a broken/huge file through PHP). Takes
+     * the already-resolved source (no re-resolve / extra metadata calls). The
+     * bucket is public (see README/config), so a plain url() is correct and stays
+     * CDN-cacheable; the configured cache headers let the CDN absorb it. Only disk
+     * sources have a public URL — a local source has none, so it 404s honestly
+     * rather than emitting a malformed /storage//abs/path redirect. Throws, so the
+     * caller never falls through.
      */
-    protected function redirectToOriginal(?string $pathPrefix, ?string $path): never
+    protected function redirectToOriginal(?ImageSource $source): never
     {
-        $source = $this->handlePath($pathPrefix, $path); // re-resolves + re-validates (404 stays 404)
+        abort_unless($source?->type === 'disk', 404);
 
-        $url = $source->type === 'disk'
-            ? Storage::disk((string) $source->disk)->url($source->path)
-            : Storage::url($source->path);
+        $url = Storage::disk((string) $source->disk)->url($source->path);
 
         throw new HttpResponseException(
             redirect()->away($url)->withHeaders(config()->array('image-transform-url.headers'))
