@@ -28,6 +28,10 @@ beforeEach(function () {
 
 it('dispatches the transform job and redirects with a short-lived cache header on a miss', function () {
     Queue::fake();
+    // Pin the TTL the assertion checks so the test doesn't break when the config
+    // default changes — it verifies the miss redirect uses the CONFIGURED pending
+    // TTL (short), not the permanent 30-day header.
+    config()->set('image-transform-url.async.pending_redirect_max_age', 10);
     putFixture('static.png', 'dir/s.png');
 
     $res = $this->get('/production/width=32,format=webp/dir/s.png');
@@ -102,7 +106,7 @@ it('still redirects animations over the frame cap without dispatching', function
     Queue::assertNothingPushed();
 });
 
-it('rate-limits the miss path by ip+path, closing the param-enumeration dedup bypass', function () {
+it('throttles only the dispatch on the miss path — still redirects, never 429s', function () {
     Queue::fake();
     config()->set('image-transform-url.rate_limit.enabled', true);
     config()->set('image-transform-url.rate_limit.disabled_for_environments', []);
@@ -111,8 +115,9 @@ it('rate-limits the miss path by ip+path, closing the param-enumeration dedup by
 
     $this->get('/production/width=32,format=webp/dir/spam.png')->assertRedirect();
     // Different options -> distinct ShouldBeUnique dedup key, but the SAME ip+path
-    // rate-limit key -> must still be throttled instead of dispatching a 2nd job.
-    $this->get('/production/width=33,format=webp/dir/spam.png')->assertStatus(429);
+    // rate-limit key -> the 2nd enqueue is throttled. The request MUST still get a
+    // redirect (a miss always serves an image); only the dispatch is suppressed.
+    $this->get('/production/width=33,format=webp/dir/spam.png')->assertRedirect();
 
     Queue::assertPushed(ProcessImageTransform::class, 1);
 });

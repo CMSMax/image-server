@@ -13,6 +13,7 @@ use Illuminate\Support\Facades\App;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\Storage;
 use Intervention\Image\Exceptions\DecoderException;
 use Intervention\Image\Exceptions\EncoderException;
@@ -72,21 +73,17 @@ class TransformImageAction extends BaseTransformImageAction
 
                 $this->guardAnimatedFrames($ip, $source, (string) $path); // over-cap → permanent redirect
 
-                // Rate-limit by IP+path (not options) BEFORE dispatch. width/height/
-                // quality are clamped to a fixed whitelist above (normalizeOptions()),
-                // so a straightforward param-enumeration attack no longer forks the
-                // dedup key — but the whitelist is config-driven (an empty `sizes`/
-                // `qualities` disables clamping) and this is the only per-request
-                // throttle left on the miss path, so keep it as defense-in-depth —
-                // the same protection the vendor gave every synchronous transform.
-                if (
-                    config()->boolean('image-transform-url.rate_limit.enabled') &&
-                    ! in_array(App::environment(), config()->array('image-transform-url.rate_limit.disabled_for_environments'), true)
-                ) {
-                    $this->rateLimit($ip, $path);
+                // Throttle only the DISPATCH, never the redirect. width/height/quality
+                // are clamped to a fixed whitelist above (normalizeOptions()), so a
+                // param-enumeration attack no longer forks the dedup key — but the
+                // whitelist is config-driven (empty `sizes`/`qualities` disables it),
+                // so keep an IP+path throttle as a queue-flood guard. Crucially it
+                // gates ONLY the enqueue: an over-limit miss still gets the temporary
+                // redirect below, so a cache miss ALWAYS serves an image (a hard 429
+                // here would hand the client a broken image during the processing gap).
+                if ($this->dispatchRateLimitPassed($ip, (string) $path)) {
+                    ProcessImageTransform::dispatch($pathPrefix, $path, $options); // deduped by ShouldBeUnique
                 }
-
-                ProcessImageTransform::dispatch($pathPrefix, $path, $options); // deduped by ShouldBeUnique
 
                 // TEMPORARY redirect — short TTL so the CDN re-checks and picks up the HIT.
                 $this->redirectToOriginal($source, [
@@ -157,6 +154,31 @@ class TransformImageAction extends BaseTransformImageAction
         }
 
         return collect($whitelist)->sortBy(fn (int $allowed) => abs($allowed - $value))->first();
+    }
+
+    /**
+     * Non-aborting dispatch throttle for the async miss path: returns whether the
+     * source may be enqueued on this request. Mirrors the vendor rate-limit KEY
+     * (image-transform-url:$ip:$path) so both share one bucket, but returns a bool
+     * instead of aborting 429 — the caller still serves the temporary redirect when
+     * this is false, so a miss never hands the client a broken image. Returns true
+     * when rate limiting is disabled or the current environment is exempt.
+     */
+    protected function dispatchRateLimitPassed(?string $ip, string $path): bool
+    {
+        if (
+            ! config()->boolean('image-transform-url.rate_limit.enabled') ||
+            in_array(App::environment(), config()->array('image-transform-url.rate_limit.disabled_for_environments'), true)
+        ) {
+            return true;
+        }
+
+        return (bool) RateLimiter::attempt(
+            key: 'image-transform-url:'.$ip.':'.$path,
+            maxAttempts: config()->integer('image-transform-url.rate_limit.max_attempts'),
+            callback: fn () => true,
+            decaySeconds: config()->integer('image-transform-url.rate_limit.decay_seconds'),
+        );
     }
 
     /**
