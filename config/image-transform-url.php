@@ -224,7 +224,7 @@ return [
         'connection' => env('IMAGE_TRANSFORM_QUEUE_CONNECTION', null),
         // CDN max-age (seconds) on the TEMPORARY miss redirect. MUST stay small so the
         // CDN re-checks origin and picks up the cached transform once the job finishes.
-        'pending_redirect_max_age' => (int) env('IMAGE_TRANSFORM_PENDING_MAX_AGE', 10),
+        'pending_redirect_max_age' => (int) env('IMAGE_TRANSFORM_PENDING_MAX_AGE', 60),
         // ShouldBeUnique lock window (seconds) — dedups dispatch during processing.
         'unique_for' => (int) env('IMAGE_TRANSFORM_JOB_UNIQUE_FOR', 300),
         // TTL (seconds) of the permanent-failure sentinel written by the job's failed().
