@@ -8,6 +8,9 @@ use App\Actions\TransformImageAction;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
+use Intervention\Image\Exceptions\DecoderException;
+use Intervention\Image\Exceptions\EncoderException;
+use Intervention\Image\Exceptions\NotSupportedException;
 use Throwable;
 
 /**
@@ -51,11 +54,27 @@ class ProcessImageTransform implements ShouldBeUnique, ShouldQueue
     }
 
     /**
-     * Permanent-failure sentinel — request path stops re-dispatching, serves
-     * the long-cache permanent redirect instead (matches today's decode-failure UX).
+     * Sentinel ONLY a genuinely permanent fault — a decode/encode failure that
+     * re-running will never fix. The request path then stops re-dispatching and
+     * serves the long-cache permanent redirect instead (matches the synchronous
+     * decode-failure UX, and mirrors the swallowed types in TransformImageAction).
+     *
+     * A transient infra fault (S3 unreachable, network, memory pressure) is NOT
+     * sentineled: leaving no sentinel lets the next request re-dispatch so the
+     * transform can recover on its own, instead of serving unoptimized originals
+     * for the full failed_lifetime window over a momentary blip.
      */
     public function failed(?Throwable $e): void
     {
+        $permanent = $e instanceof DecoderException
+            || $e instanceof EncoderException
+            || $e instanceof NotSupportedException
+            || $e instanceof \ImagickException;
+
+        if (! $permanent) {
+            return;
+        }
+
         app(TransformImageAction::class)->markTransformFailed(
             $this->pathPrefix, $this->path, $this->options,
         );

@@ -6,6 +6,7 @@ use App\Jobs\ProcessImageTransform;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
+use Intervention\Image\Exceptions\DecoderException;
 
 /**
  * Coverage for the async miss path: a cache miss dispatches a background
@@ -131,4 +132,19 @@ it('transforms synchronously when the async flag is off', function () {
 
     $res->assertOk();
     Queue::assertNothingPushed();
+});
+
+it('sentinels a permanent decode failure but leaves a transient infra failure re-dispatchable', function () {
+    $job = new ProcessImageTransform('production', 'dir/x.png', 'format=webp,width=64');
+    $parsed = ['format' => 'webp', 'width' => 64]; // alphabetical — matches parseOptions()
+    $sentinel = 'image-transform-url:failed:_cache/image-transform-url/production/'.md5(json_encode($parsed)).'_dir/x.png';
+
+    // Transient infra fault (S3/network) -> NO sentinel, so the next request can
+    // re-dispatch and recover instead of serving originals for failed_lifetime.
+    $job->failed(new RuntimeException('S3 timeout'));
+    expect(Cache::has($sentinel))->toBeFalse();
+
+    // Permanent decode fault -> sentinel written, request path stops re-dispatching.
+    $job->failed(new DecoderException('corrupt source'));
+    expect(Cache::has($sentinel))->toBeTrue();
 });
