@@ -19,6 +19,15 @@ beforeEach(function () {
     config()->set('image-transform-url.cache.enabled', false);
     config()->set('image-transform-url.rate_limit.enabled', false);
     config()->set('image-transform-url.max_animated_frames', 30);
+    // These tests assert transformed content synchronously; the async miss path
+    // (default ON) redirects instead — see tests/Feature/AsyncTransformTest.php.
+    config()->set('image-transform-url.async.enabled', false);
+    // These tests use arbitrary widths and multiple formats (gif/png/webp) to
+    // exercise decode/frame-guard behavior, not the size/format whitelist —
+    // see tests/Feature/AllowedSizesAndFormatsTest.php for that guard.
+    config()->set('image-transform-url.sizes', []);
+    config()->set('image-transform-url.qualities', []);
+    config()->set('image-transform-url.allowed_formats', ['webp', 'gif', 'png']);
 });
 
 function putFixture(string $name, string $storedAs): void
@@ -187,7 +196,7 @@ it('serves the cache on the default (no-prefix) route', function () {
     config()->set('image-transform-url.cache.enabled', true);
     config()->set('image-transform-url.cache.disk', 's3-cache');
 
-    $parsed = ['width' => 64, 'format' => 'webp'];
+    $parsed = ['format' => 'webp', 'width' => 64]; // alphabetical — matches normalizeOptions()'s ksort()
     $endPath = '_cache/image-transform-url/production/'.md5(json_encode($parsed)).'_dir/a.webp';
     Storage::disk('s3-cache')->put($endPath, 'SEEDED-DEFAULT-ROUTE');
     Cache::put('image-transform-url:'.Storage::disk('s3-cache')->path($endPath), true, 3600);
@@ -255,7 +264,7 @@ it('404s a deleted source even while a stale transform is cached', function () {
     config()->set('image-transform-url.cache.enabled', true);
     config()->set('image-transform-url.cache.disk', 's3-cache');
 
-    $parsed = ['width' => 64, 'format' => 'webp'];
+    $parsed = ['format' => 'webp', 'width' => 64]; // alphabetical — matches normalizeOptions()'s ksort()
     $endPath = '_cache/image-transform-url/production/'.md5(json_encode($parsed)).'_dir/gone.webp';
     Storage::disk('s3-cache')->put($endPath, 'STALE-BODY');
     Cache::put('image-transform-url:'.Storage::disk('s3-cache')->path($endPath), true, 3600);
@@ -289,7 +298,7 @@ it('serves a cached transform from a non-local (s3) cache disk', function () {
     config()->set('image-transform-url.cache.disk', 's3-cache');
     config()->set('image-transform-url.max_animated_frames', 2); // would redirect the 3-frame file
 
-    $parsed = ['width' => 64, 'format' => 'webp'];
+    $parsed = ['format' => 'webp', 'width' => 64]; // alphabetical — matches normalizeOptions()'s ksort()
     $endPath = '_cache/image-transform-url/production/'.md5(json_encode($parsed)).'_dir/a.webp';
     Storage::disk('s3-cache')->put($endPath, 'SEEDED-CACHE-BODY');
     Cache::put('image-transform-url:'.Storage::disk('s3-cache')->path($endPath), true, 3600);

@@ -7,11 +7,13 @@ namespace App\Actions;
 use AceOfAces\LaravelImageTransformUrl\Actions\TransformImageAction as BaseTransformImageAction;
 use AceOfAces\LaravelImageTransformUrl\ValueObjects\ImageResult;
 use AceOfAces\LaravelImageTransformUrl\ValueObjects\ImageSource;
+use App\Jobs\ProcessImageTransform;
 use Illuminate\Http\Exceptions\HttpResponseException;
 use Illuminate\Support\Facades\App;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\Storage;
 use Intervention\Image\Exceptions\DecoderException;
 use Intervention\Image\Exceptions\EncoderException;
@@ -56,11 +58,40 @@ class TransformImageAction extends BaseTransformImageAction
             // $pathPrefix/$path by reference — so the cache key below matches the
             // vendor's writer, including on the default (no-prefix) route.
             $source = $this->handlePath($pathPrefix, $path);
+            $options = $this->normalizeOptions($options);
 
             if ($cached = $this->servedFromCache($pathPrefix, $path, $options)) {
                 return $cached; // disk-native cache read — works for S3 (the vendor's File:: read does not)
             }
 
+            // When image is not optimized, dispatch to the queue and return a temporary redirect
+            if (config()->boolean('image-transform-url.async.enabled')) {
+                // Prior permanent failure — serve the long-cache redirect, do not re-dispatch.
+                if (Cache::has($this->failureSentinelKey($pathPrefix, $path, $options))) {
+                    $this->redirectToOriginal($source);
+                }
+
+                $this->guardAnimatedFrames($ip, $source, (string) $path); // over-cap → permanent redirect
+
+                // Throttle only the DISPATCH, never the redirect. width/height/quality
+                // are clamped to a fixed whitelist above (normalizeOptions()), so a
+                // param-enumeration attack no longer forks the dedup key — but the
+                // whitelist is config-driven (empty `sizes`/`qualities` disables it),
+                // so keep an IP+path throttle as a queue-flood guard. Crucially it
+                // gates ONLY the enqueue: an over-limit miss still gets the temporary
+                // redirect below, so a cache miss ALWAYS serves an image (a hard 429
+                // here would hand the client a broken image during the processing gap).
+                if ($this->dispatchRateLimitPassed($ip, (string) $path)) {
+                    ProcessImageTransform::dispatch($pathPrefix, $path, $options); // deduped by ShouldBeUnique
+                }
+
+                // TEMPORARY redirect — short TTL so the CDN re-checks and picks up the HIT.
+                $this->redirectToOriginal($source, [
+                    'Cache-Control' => 'public, max-age='.config()->integer('image-transform-url.async.pending_redirect_max_age'),
+                ]);
+            }
+
+            // If image is optimized, show the image
             $this->guardAnimatedFrames($ip, $source, (string) $path); // may throttle + redirect
 
             return parent::handle($ip, $pathPrefix, $options, $path);
@@ -69,14 +100,85 @@ class TransformImageAction extends BaseTransformImageAction
         } catch (HttpExceptionInterface $e) {
             throw $e; // preserve HTTP control-flow (404 not-found, 429 rate-limit, etc.)
         } catch (DecoderException|EncoderException|NotSupportedException|\ImagickException $e) {
-            // Decode/encode failure — serve the original instead of a 500. Intervention
-            // wraps decode faults in DecoderException, but its Imagick encoders throw
-            // ImagickException bare (e.g. CacheResourcesExhausted under a policy.xml /
-            // memory limit), so catch that too. ImagickException only originates from
-            // Imagick ops, so genuine faults (S3, config, TypeError) still surface as 5xx.
+            // Decode/encode failure — serve the original instead of a 500.
             report($e);
             $this->redirectToOriginal($source); // throws HttpResponseException
         }
+    }
+
+    /**
+     * App-level abuse guard: canonicalize width/height to the nearest allowed
+     * size and reject a non-whitelisted explicit format, before anything else
+     * reads/writes the cache or dispatches a job. Re-serializes with sorted
+     * keys so option order can't fork the cache/dedup key either (e.g.
+     * `format=webp,width=200` and `width=200,format=webp` collapse to one).
+     */
+    protected function normalizeOptions(string $rawOptions): string
+    {
+        $options = static::parseOptions($rawOptions);
+
+        if (array_key_exists('width', $options)) {
+            $options['width'] = $this->nearestAllowedValue((int) $options['width'], config()->array('image-transform-url.sizes'));
+        }
+
+        if (array_key_exists('height', $options)) {
+            $options['height'] = $this->nearestAllowedValue((int) $options['height'], config()->array('image-transform-url.sizes'));
+        }
+
+        if (array_key_exists('quality', $options)) {
+            $options['quality'] = $this->nearestAllowedValue((int) $options['quality'], config()->array('image-transform-url.qualities'));
+        }
+
+        if (array_key_exists('format', $options)) {
+            abort_unless(
+                in_array($options['format'], config()->array('image-transform-url.allowed_formats'), true),
+                404,
+            );
+        }
+
+        ksort($options);
+
+        return collect($options)->map(fn ($value, $key) => "{$key}={$value}")->implode(',');
+    }
+
+    /**
+     * Round a requested width/height/quality to the nearest value in the given
+     * whitelist, bounding cache/queue cardinality per source image (an
+     * enumerated width=101, width=102, ... all collapse onto one entry). An
+     * empty whitelist disables the guard — the raw value passes through.
+     */
+    protected function nearestAllowedValue(int $value, array $whitelist): int
+    {
+        if ($whitelist === []) {
+            return $value;
+        }
+
+        return collect($whitelist)->sortBy(fn (int $allowed) => abs($allowed - $value))->first();
+    }
+
+    /**
+     * Non-aborting dispatch throttle for the async miss path: returns whether the
+     * source may be enqueued on this request. Mirrors the vendor rate-limit KEY
+     * (image-transform-url:$ip:$path) so both share one bucket, but returns a bool
+     * instead of aborting 429 — the caller still serves the temporary redirect when
+     * this is false, so a miss never hands the client a broken image. Returns true
+     * when rate limiting is disabled or the current environment is exempt.
+     */
+    protected function dispatchRateLimitPassed(?string $ip, string $path): bool
+    {
+        if (
+            ! config()->boolean('image-transform-url.rate_limit.enabled') ||
+            in_array(App::environment(), config()->array('image-transform-url.rate_limit.disabled_for_environments'), true)
+        ) {
+            return true;
+        }
+
+        return (bool) RateLimiter::attempt(
+            key: 'image-transform-url:'.$ip.':'.$path,
+            maxAttempts: config()->integer('image-transform-url.rate_limit.max_attempts'),
+            callback: fn () => true,
+            decaySeconds: config()->integer('image-transform-url.rate_limit.decay_seconds'),
+        );
     }
 
     /**
@@ -219,6 +321,80 @@ class TransformImageAction extends BaseTransformImageAction
     }
 
     /**
+     * Background half of the async miss path (called from ProcessImageTransform).
+     * Reuses the vendor pipeline (DRY — no re-implementing Intervention), then
+     * stores the result explicitly and exactly once from the returned bytes.
+     */
+    public function processAndCache(?string $pathPrefix, ?string $path, string $rawOptions): void
+    {
+        // Trusted internal call — the rate limiter is a public-abuse guard, and the
+        // parent's own cache read/deferred-store must not run (we store explicitly
+        // below). A persistent `queue:work` process reuses the same booted app
+        // across many jobs (config is NOT reset between them), so these overrides
+        // MUST be restored — otherwise the first async job permanently disables
+        // caching/rate-limiting for every request that process (or, under the
+        // `sync` queue driver, the current request/test) handles afterwards.
+        $originalRateLimit = config()->boolean('image-transform-url.rate_limit.enabled');
+        $originalCacheEnabled = config()->boolean('image-transform-url.cache.enabled');
+
+        config()->set('image-transform-url.rate_limit.enabled', false);
+        config()->set('image-transform-url.cache.enabled', false);
+
+        try {
+            $result = parent::handle(null, $pathPrefix, $rawOptions, $path);
+
+            $this->storeResultBytes($pathPrefix, $path, $rawOptions, $result);
+        } finally {
+            config()->set('image-transform-url.rate_limit.enabled', $originalRateLimit);
+            config()->set('image-transform-url.cache.enabled', $originalCacheEnabled);
+        }
+    }
+
+    /**
+     * Store the transform from an ImageResult's raw bytes
+     */
+    protected function storeResultBytes(?string $pathPrefix, ?string $path, string $rawOptions, ImageResult $result): void
+    {
+        $options = static::parseOptions($rawOptions);
+        $diskName = config()->string('image-transform-url.cache.disk');
+
+        Storage::disk($diskName)->put($this->getCacheEndPath($pathPrefix, $path, $options), $result->content);
+
+        Cache::put(
+            key: 'image-transform-url:'.$this->getCachePath($pathPrefix, $path, $options),
+            value: true,
+            ttl: config()->integer('image-transform-url.cache.lifetime'),
+        );
+
+        if (config("filesystems.disks.{$diskName}.driver") !== 's3') {
+            $this->manageCacheSize();
+        }
+    }
+
+    /**
+     * Cache key for the permanent-failure sentinel written by the job's failed().
+     */
+    protected function failureSentinelKey(?string $pathPrefix, ?string $path, string $rawOptions): string
+    {
+        $options = static::parseOptions($rawOptions);
+
+        return 'image-transform-url:failed:'.$this->getCacheEndPath($pathPrefix, $path, $options);
+    }
+
+    /**
+     * Mark a transform as permanently failed so the request path stops
+     * re-dispatching and serves the long-cache permanent redirect instead.
+     */
+    public function markTransformFailed(?string $pathPrefix, ?string $path, string $rawOptions): void
+    {
+        Cache::put(
+            $this->failureSentinelKey($pathPrefix, $path, $rawOptions),
+            true,
+            config()->integer('image-transform-url.async.failed_lifetime'),
+        );
+    }
+
+    /**
      * Read the raw source bytes for a disk- or local-based source.
      */
     protected function readSourceBytes(ImageSource $source): string
@@ -233,19 +409,24 @@ class TransformImageAction extends BaseTransformImageAction
      * an image (and the app never streams a broken/huge file through PHP). Takes
      * the already-resolved source (no re-resolve / extra metadata calls). The
      * bucket is public (see README/config), so a plain url() is correct and stays
-     * CDN-cacheable; the configured cache headers let the CDN absorb it. Only disk
-     * sources have a public URL — a local source has none, so it 404s honestly
-     * rather than emitting a malformed /storage//abs/path redirect. Throws, so the
-     * caller never falls through.
+     * CDN-cacheable. Only disk sources have a public URL — a local source has
+     * none, so it 404s honestly rather than emitting a malformed /storage//abs/path
+     * redirect. Throws, so the caller never falls through.
+     *
+     * $headers defaults to the permanent (30-day) config headers — used for the
+     * frame-guard/failure/sentinel redirects, where the source will never
+     * transform. The async-miss path passes a short-lived header set instead, so
+     * the CDN re-checks origin once the queued transform finishes.
      */
-    protected function redirectToOriginal(?ImageSource $source): never
+    protected function redirectToOriginal(?ImageSource $source, ?array $headers = null): never
     {
         abort_unless($source?->type === 'disk', 404);
+        $headers ??= config()->array('image-transform-url.headers');
 
         $url = Storage::disk((string) $source->disk)->url($source->path);
 
         throw new HttpResponseException(
-            redirect()->away($url)->withHeaders(config()->array('image-transform-url.headers'))
+            redirect()->away($url)->withHeaders($headers)
         );
     }
 }
