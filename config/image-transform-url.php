@@ -177,4 +177,58 @@ return [
     */
 
     'max_animated_frames' => (int) env('IMAGE_TRANSFORM_MAX_ANIMATED_FRAMES', 30),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Allowed Sizes + Formats (app extension)
+    |--------------------------------------------------------------------------
+    |
+    | Without a whitelist, width/height accept ANY positive integer — a client
+    | can enumerate width=101, width=102, width=103... and each one is a
+    | distinct cache entry (and, on the async path, a distinct queued transform
+    | job), so the request-side rate limiter is the only thing bounding that.
+    | Restricting to a fixed set of sizes bounds cache/queue cardinality per
+    | source image outright: an out-of-list width/height is rounded to the
+    | NEAREST allowed value (not rejected) before the cache key is computed, so
+    | e.g. width=203 and width=210 both resolve to the same 200px cache entry.
+    | Set to an empty array to disable (any width/height passes through as-is).
+    |
+    | `qualities` applies the same nearest-value clamp to `quality=` — otherwise
+    | quality=1..100 is a 100-value enumeration space per size/format combo that
+    | the size whitelist above does nothing to bound.
+    |
+    | `allowed_formats` similarly restricts the `format=` option: an explicit
+    | format NOT in this list 404s. Omitting `format=` entirely is unaffected
+    | (the vendor still defaults to the source's own mime type in that case).
+    |
+    */
+
+    'sizes' => env('IMAGE_TRANSFORM_SIZES', [200, 400, 600, 800, 1000, 1280, 1440, 1920]),
+
+    'qualities' => env('IMAGE_TRANSFORM_QUALITIES', [50, 70, 90, 100]),
+
+    'allowed_formats' => env('IMAGE_TRANSFORM_ALLOWED_FORMATS', ['webp']),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Async Transform (app extension)
+    |--------------------------------------------------------------------------
+    | On a cache miss, redirect to the original (short TTL) and process the
+    | transform on the queue instead of blocking the request. Disable to fall
+    | back to the synchronous transform.
+    */
+    'async' => [
+        'enabled' => env('IMAGE_TRANSFORM_ASYNC_ENABLED', true),
+        // Queue name + connection for the transform job (null connection = default).
+        'queue' => env('IMAGE_TRANSFORM_QUEUE', 'default'),
+        'connection' => env('IMAGE_TRANSFORM_QUEUE_CONNECTION', null),
+        // CDN max-age (seconds) on the TEMPORARY miss redirect. MUST stay small so the
+        // CDN re-checks origin and picks up the cached transform once the job finishes.
+        'pending_redirect_max_age' => (int) env('IMAGE_TRANSFORM_PENDING_MAX_AGE', 10),
+        // ShouldBeUnique lock window (seconds) — dedups dispatch during processing.
+        'unique_for' => (int) env('IMAGE_TRANSFORM_JOB_UNIQUE_FOR', 300),
+        // TTL (seconds) of the permanent-failure sentinel written by the job's failed().
+        // Kept moderate so a transient infra failure eventually retries.
+        'failed_lifetime' => (int) env('IMAGE_TRANSFORM_FAILED_LIFETIME', 60 * 60 * 24),
+    ],
 ];
