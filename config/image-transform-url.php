@@ -227,8 +227,9 @@ return [
         'pending_redirect_max_age' => (int) env('IMAGE_TRANSFORM_PENDING_MAX_AGE', 60),
         // ShouldBeUnique lock window (seconds) — dedups dispatch during processing.
         'unique_for' => (int) env('IMAGE_TRANSFORM_JOB_UNIQUE_FOR', 300),
-        // TTL (seconds) of the permanent-failure sentinel written by the job's failed().
-        // Kept moderate so a transient infra failure eventually retries.
-        'failed_lifetime' => (int) env('IMAGE_TRANSFORM_FAILED_LIFETIME', 60 * 60 * 24),
+        // TTL (seconds) of the permanent-failure sentinel written by the job's failed()
+        // on a decode/encode fault. 1h so a fixed/re-uploaded source recovers within the
+        // hour rather than serving the original for a full day.
+        'failed_lifetime' => (int) env('IMAGE_TRANSFORM_FAILED_LIFETIME', 60 * 60),
     ],
 ];
